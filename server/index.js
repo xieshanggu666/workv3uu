@@ -1,5 +1,6 @@
 import express from 'express'
 import { db } from './db.js'
+import { pickMergeCandidate, mergeRejectReason } from './merge.js'
 
 const app = express()
 app.use(express.json())
@@ -13,11 +14,18 @@ const now = () => new Date().toLocaleString('zh-CN')
 const AUTO_LEVELS = ['red', 'orange']
 const LV_TEXT = { red: '红色', orange: '橙色', yellow: '黄色' }
 
-// 危机列表（含来源规则、未解除预警数、时间线）
+// 危机承接的预警规则（多对多）
+const crisisRules = (cid) =>
+  q(`SELECT a.* FROM crisis_alerts ca JOIN alerts a ON a.id=ca.alert_id WHERE ca.crisis_id=? ORDER BY ca.rowid`, cid)
+
+// 危机列表（含承接规则、未解除预警数、时间线）
 function crisisList(withTimeline = false) {
-  const list = q(`SELECT c.*, a.title alert_title,
+  const list = q(`SELECT c.*,
+    (SELECT GROUP_CONCAT(t.title, '、') FROM (
+      SELECT a.title FROM crisis_alerts ca JOIN alerts a ON a.id=ca.alert_id
+      WHERE ca.crisis_id=c.id ORDER BY ca.rowid) t) alert_titles,
     (SELECT COUNT(*) FROM alert_events ae WHERE ae.crisis_id=c.id AND ae.status='open') open_events
-    FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id ORDER BY c.id DESC`)
+    FROM crisis c ORDER BY c.id DESC`)
   if (!withTimeline) return list
   return list.map((c) => ({ ...c, timeline: q('SELECT * FROM crisis_timeline WHERE crisis_id=? ORDER BY id DESC', c.id) }))
 }
@@ -148,17 +156,27 @@ app.post('/api/posts/batch', (req, res) => {
     results,
     summary: {
       alerts: fired.length,
-      crisesCreated: fired.filter((t) => t.crisisId && !t.deduped).length,
-      crisesMerged: fired.filter((t) => t.deduped).length
+      // 同一事件可承接多条规则，按危机去重统计
+      crisesCreated: new Set(fired.filter((t) => t.crisisId && !t.deduped).map((t) => t.crisisId)).size,
+      crisesMerged: new Set(fired.filter((t) => t.deduped).map((t) => t.crisisId)).size
     },
     stats: statsSummary() // 统计刷新
   })
 })
 
+// 危机承接规则：已链接则忽略；既有事件新承接规则时写入时间线
+function attachRule(crisisId, al, silent = false) {
+  const r = run('INSERT OR IGNORE INTO crisis_alerts (crisis_id, alert_id) VALUES (?,?)', crisisId, al.id)
+  if (!silent && r.changes > 0) {
+    run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
+      crisisId, '规则承接', `事件承接预警规则「${al.title}」，后续该规则触发将并入本事件`, now())
+  }
+}
+
 function checkAlerts(postId) {
   const p = q1('SELECT * FROM posts WHERE id=?', postId)
   const alerts = q('SELECT * FROM alerts WHERE active=1')
-  const fired = []
+  const matched = []
   for (const al of alerts) {
     const kwHit = !al.keyword || (p.title + p.content).includes(al.keyword)
     const sentHit = !al.sentiment || p.sentiment === al.sentiment
@@ -166,29 +184,54 @@ function checkAlerts(postId) {
     if (!(kwHit && sentHit && heatHit)) continue
     run('UPDATE alerts SET trigger_count=trigger_count+1 WHERE id=?', al.id)
     const detail = `命中关键词「${al.keyword || '全部'}」· ${al.sentiment ? '情感：' + al.sentiment : '不限情感'} · 热度${p.heat}`
-    // 闭环：高等级预警 → 危机事件。同规则存在未结案危机则去重并入，否则自动建档
-    let crisisId = null, deduped = false
-    if (AUTO_LEVELS.includes(al.level)) {
-      const open = q1("SELECT * FROM crisis WHERE alert_id=? AND status!='closed' ORDER BY id DESC LIMIT 1", al.id)
-      if (open) {
-        crisisId = open.id
-        deduped = true
-        run('UPDATE crisis SET updated=? WHERE id=?', now(), open.id)
-        run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
-          open.id, '预警再次触发', `${detail} · 关联舆情《${p.title}》`, now())
-      } else {
-        const r = run('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,alert_id,origin) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-          al.title, al.level, 'monitoring', '',
-          `由${LV_TEXT[al.level]}预警「${al.title}」自动建档：命中关键词「${al.keyword || '全部'}」，首条关联舆情《${p.title}》（热度${p.heat}）。`,
-          now(), now(), '', al.keyword, al.id, 'auto')
-        crisisId = Number(r.lastInsertRowid)
-        run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
-          crisisId, '自动建档', `高等级预警触发：${detail}`, now())
-      }
+    matched.push({ al, detail })
+  }
+  // 闭环：高等级预警 → 危机事件。同一事件（本帖）命中的多条规则承接同一危机；
+  // 归并按规则配置（话题 + 时间窗口）判定，不满足则单独建档、分别处置
+  const auto = matched.filter((m) => AUTO_LEVELS.includes(m.al.level))
+  let crisisId = null, deduped = false
+  if (auto.length) {
+    const nowMs = Date.now()
+    let crisis = null
+    for (const m of auto) {
+      const cands = q(`SELECT c.* FROM crisis c JOIN crisis_alerts ca ON ca.crisis_id=c.id
+        WHERE ca.alert_id=? AND c.status!='closed'`, m.al.id)
+      crisis = pickMergeCandidate(cands, m.al, p.topic, nowMs)
+      if (crisis) break
     }
+    if (crisis) {
+      // 去重并入：同事件多规则一并承接，时间线逐规则记录
+      crisisId = crisis.id
+      deduped = true
+      run('UPDATE crisis SET updated=? WHERE id=?', now(), crisis.id)
+      for (const m of auto) attachRule(crisis.id, m.al)
+      for (const m of auto) {
+        run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
+          crisis.id, '预警再次触发', `【${m.al.title}】${m.detail} · 关联舆情《${p.title}》`, now())
+      }
+    } else {
+      // 自动建档：若同规则已有进行中事件但不满足归并条件，注明单独建档原因
+      const first = auto[0]
+      const openCrisis = q1(`SELECT c.* FROM crisis c JOIN crisis_alerts ca ON ca.crisis_id=c.id
+        WHERE ca.alert_id=? AND c.status!='closed' ORDER BY c.id DESC LIMIT 1`, first.al.id)
+      const why = openCrisis ? `（与进行中事件 #${openCrisis.id} ${mergeRejectReason(first.al, openCrisis, p.topic, nowMs)}，单独建档）` : ''
+      const extra = auto.length > 1 ? `；同帖命中规则 ${auto.slice(1).map((m) => `「${m.al.title}」`).join('、')}，一并承接` : ''
+      const r = run('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,topic,alert_id,origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+        first.al.title, first.al.level, 'monitoring', '',
+        `由${LV_TEXT[first.al.level]}预警「${first.al.title}」自动建档：命中关键词「${first.al.keyword || '全部'}」，首条关联舆情《${p.title}》（热度${p.heat}）。${extra}`,
+        now(), now(), '', first.al.keyword, p.topic, first.al.id, 'auto')
+      crisisId = Number(r.lastInsertRowid)
+      for (const m of auto) attachRule(crisisId, m.al, true)
+      run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)',
+        crisisId, '自动建档', `高等级预警触发：${first.detail}${extra}${why}`, now())
+    }
+  }
+  const fired = []
+  for (const m of matched) {
+    const isAuto = AUTO_LEVELS.includes(m.al.level)
     const ev = run('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)',
-      al.id, postId, crisisId, detail, now(), 'open', null)
-    fired.push({ alert: al.title, level: al.level, eventId: Number(ev.lastInsertRowid), crisisId, deduped })
+      m.al.id, postId, isAuto ? crisisId : null, m.detail, now(), 'open', null)
+    fired.push({ alert: m.al.title, level: m.al.level, eventId: Number(ev.lastInsertRowid), crisisId: isAuto ? crisisId : null, deduped: isAuto ? deduped : false })
   }
   return fired
 }
@@ -214,9 +257,10 @@ app.get('/api/alerts', (req, res) => {
   })
 })
 app.post('/api/alerts', (req, res) => {
-  const { title, level, keyword, sentiment, heat_min } = req.body
-  run('INSERT INTO alerts (title,level,keyword,sentiment,heat_min,active,created,trigger_count) VALUES (?,?,?,?,?,1,?,0)',
-    title, level, keyword || '', sentiment || '', heat_min || 0, now())
+  const { title, level, keyword, sentiment, heat_min, merge_topic, merge_window } = req.body
+  run('INSERT INTO alerts (title,level,keyword,sentiment,heat_min,active,created,trigger_count,merge_topic,merge_window) VALUES (?,?,?,?,?,1,?,0,?,?)',
+    title, level, keyword || '', sentiment || '', heat_min || 0, now(),
+    merge_topic === undefined ? 1 : (merge_topic ? 1 : 0), Math.max(0, +merge_window || 0))
   res.json({ ok: true })
 })
 app.post('/api/alerts/:id/toggle', (req, res) => {
@@ -228,6 +272,7 @@ app.post('/api/alerts/:id/toggle', (req, res) => {
 app.delete('/api/alerts/:id', (req, res) => {
   run('DELETE FROM alerts WHERE id=?', req.params.id)
   run('DELETE FROM alert_events WHERE alert_id=?', req.params.id)
+  run('DELETE FROM crisis_alerts WHERE alert_id=?', req.params.id)
   res.json({ ok: true })
 })
 
@@ -277,9 +322,9 @@ app.get('/api/crisis', (req, res) => {
   res.json(crisisList(true))
 })
 app.post('/api/crisis', (req, res) => {
-  const { title, level, keyword, plan, analysis, linked_email } = req.body
-  const r = run("INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,origin) VALUES (?,?,?,?,?,?,?,?,?,'manual')",
-    title, level || 'orange', 'monitoring', plan || '', analysis || '', now(), now(), linked_email || '', keyword || '')
+  const { title, level, keyword, plan, analysis, linked_email, topic } = req.body
+  const r = run("INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,topic,origin) VALUES (?,?,?,?,?,?,?,?,?,?,'manual')",
+    title, level || 'orange', 'monitoring', plan || '', analysis || '', now(), now(), linked_email || '', keyword || '', topic || '')
   const id = Number(r.lastInsertRowid)
   run('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)', id, '事件建档', '人工建档，初始响应', now())
   res.json({ ok: true, id })
@@ -299,23 +344,32 @@ app.post('/api/crisis/:id/timeline', (req, res) => {
   res.json({ ok: true })
 })
 
-// 回溯：危机档案 + 关联预警触发记录 + 统计
+// 回溯：危机档案 + 承接规则 + 关联预警触发记录 + 统计（按规则分组）
 app.get('/api/crisis/:id/review', (req, res) => {
-  const c = q1('SELECT c.*, a.title alert_title FROM crisis c LEFT JOIN alerts a ON a.id=c.alert_id WHERE c.id=?', req.params.id)
+  const c = q1('SELECT * FROM crisis WHERE id=?', req.params.id)
   if (!c) return res.status(404).json({ error: 'not found' })
+  const rules = crisisRules(c.id)
   const timeline = q('SELECT * FROM crisis_timeline WHERE crisis_id=? ORDER BY id DESC', c.id)
   const events = q(`SELECT ae.*, p.title pt, p.heat, p.sentiment sent, a.title alert_title, a.level alert_level
     FROM alert_events ae LEFT JOIN posts p ON p.id=ae.post_id LEFT JOIN alerts a ON a.id=ae.alert_id
     WHERE ae.crisis_id=? ORDER BY ae.id DESC`, c.id)
   const open = events.filter((e) => e.status === 'open').length
+  // 同一事件承接多条规则：按规则分组统计触发/解除
+  const byRule = rules.map((r) => {
+    const evs = events.filter((e) => e.alert_id === r.id)
+    const o = evs.filter((e) => e.status === 'open').length
+    return { id: r.id, title: r.title, level: r.level, triggers: evs.length, open: o, resolved: evs.length - o }
+  })
   res.json({
-    crisis: c, timeline, events,
+    crisis: { ...c, alert_titles: rules.map((r) => r.title).join('、') },
+    rules, timeline, events,
     stats: {
       triggers: events.length,
       open,
       resolved: events.length - open,
       firstAt: events.length ? events[events.length - 1].time : null,
-      lastAt: events.length ? events[0].time : null
+      lastAt: events.length ? events[0].time : null,
+      byRule
     }
   })
 })
@@ -335,6 +389,7 @@ app.post('/api/crisis/:id/close', (req, res) => {
 })
 app.delete('/api/crisis/:id', (req, res) => {
   run('DELETE FROM crisis_timeline WHERE crisis_id=?', req.params.id)
+  run('DELETE FROM crisis_alerts WHERE crisis_id=?', req.params.id)
   run('DELETE FROM crisis WHERE id=?', req.params.id)
   res.json({ ok: true })
 })

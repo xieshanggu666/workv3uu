@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS alerts (
   heat_min INTEGER NOT NULL DEFAULT 0,
   active INTEGER NOT NULL DEFAULT 1,
   created TEXT NOT NULL,
-  trigger_count INTEGER NOT NULL DEFAULT 0
+  trigger_count INTEGER NOT NULL DEFAULT 0,
+  merge_topic INTEGER NOT NULL DEFAULT 1,   -- 危机归并：是否按话题归并
+  merge_window INTEGER NOT NULL DEFAULT 24  -- 危机归并：时间窗口（小时），0=不限
 );
 CREATE TABLE IF NOT EXISTS alert_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,8 +66,15 @@ CREATE TABLE IF NOT EXISTS crisis (
   updated TEXT NOT NULL,
   linked_email TEXT NOT NULL DEFAULT '',
   keyword TEXT NOT NULL DEFAULT '',
-  alert_id INTEGER,               -- 来源预警规则（自动建档时写入）
+  topic TEXT NOT NULL DEFAULT '', -- 归并话题（自动建档时取首条舆情话题）
+  alert_id INTEGER,               -- 来源预警规则（自动建档时写入；多规则承接见 crisis_alerts）
   origin TEXT NOT NULL DEFAULT 'manual'  -- auto/manual
+);
+-- 危机 ↔ 预警规则 多对多承接关系（同一事件可承接多条规则，同一规则可对应多个事件）
+CREATE TABLE IF NOT EXISTS crisis_alerts (
+  crisis_id INTEGER NOT NULL,
+  alert_id INTEGER NOT NULL,
+  PRIMARY KEY (crisis_id, alert_id)
 );
 CREATE TABLE IF NOT EXISTS crisis_timeline (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,6 +95,13 @@ ensureColumn('alert_events', 'status', "status TEXT NOT NULL DEFAULT 'open'")
 ensureColumn('alert_events', 'resolved', 'resolved TEXT')
 ensureColumn('crisis', 'alert_id', 'alert_id INTEGER')
 ensureColumn('crisis', 'origin', "origin TEXT NOT NULL DEFAULT 'manual'")
+ensureColumn('crisis', 'topic', "topic TEXT NOT NULL DEFAULT ''")
+ensureColumn('alerts', 'merge_topic', 'merge_topic INTEGER NOT NULL DEFAULT 1')
+ensureColumn('alerts', 'merge_window', 'merge_window INTEGER NOT NULL DEFAULT 24')
+
+// 旧关联迁移：crisis.alert_id（一对一）→ crisis_alerts（多对多）；历史时间线原样保留
+db.exec(`INSERT OR IGNORE INTO crisis_alerts (crisis_id, alert_id)
+  SELECT id, alert_id FROM crisis WHERE alert_id IS NOT NULL`)
 
 function seed() {
   const n = db.prepare('SELECT COUNT(*) c FROM posts').get().c
@@ -134,42 +150,53 @@ function seed() {
 
   const ago = (m) => new Date(now.getTime() - m * 60000).toLocaleString('zh-CN')
 
-  const ai = db.prepare('INSERT INTO alerts (title,level,keyword,sentiment,heat_min,active,created,trigger_count) VALUES (?,?,?,?,?,?,?,?)')
-  const a1 = ai.run('负面情绪集中爆发', 'red', '卫生', 'negative', 80, 1, nowStr, 1).lastInsertRowid
-  const a2 = ai.run('投诉类话题升温', 'orange', '投诉', 'negative', 65, 1, nowStr, 2).lastInsertRowid
-  const a3 = ai.run('选址关键词监控', 'yellow', '延期', 'negative', 60, 1, nowStr, 1).lastInsertRowid
-  ai.run('正面口碑监测', 'yellow', '服务', 'positive', 50, 1, nowStr, 1)
+  const ai = db.prepare('INSERT INTO alerts (title,level,keyword,sentiment,heat_min,active,created,trigger_count,merge_topic,merge_window) VALUES (?,?,?,?,?,?,?,?,?,?)')
+  const a1 = ai.run('负面情绪集中爆发', 'red', '卫生', 'negative', 80, 1, nowStr, 1, 1, 24).lastInsertRowid
+  const a2 = ai.run('投诉类话题升温', 'orange', '投诉', 'negative', 65, 1, nowStr, 2, 1, 24).lastInsertRowid
+  const a3 = ai.run('选址关键词监控', 'yellow', '延期', 'negative', 60, 1, nowStr, 1, 1, 24).lastInsertRowid
+  ai.run('正面口碑监测', 'yellow', '服务', 'positive', 50, 1, nowStr, 1, 0, 0)
+  const a5 = ai.run('负面高热舆情', 'red', '', 'negative', 85, 1, nowStr, 1, 0, 0).lastInsertRowid
 
-  // 危机事件：c1 红色自动建档·处置中；c2 橙色自动建档·监测中（含去重并入）；c3 人工建档·已结案
-  const ci = db.prepare('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,alert_id,origin) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+  // 危机事件：c1 红色自动建档·处置中（同帖命中 a1+a5，一事多规）；c2/c4 同规则 a2 不同话题分别建档；
+  // c3 人工建档·已结案
+  const ci = db.prepare('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,topic,alert_id,origin) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)')
   const c1 = ci.run('某连锁品牌门店卫生事件', 'red', 'disposal',
     '1. 24小时内全网回应，公布整改时间表\n2. 关停涉事门店并启动第三方复查\n3. 官方渠道连续发布整改动态\n4. 与权威媒体合作发布透明报告',
     '负面传播主阵地为短视频与微博，需在2小时内完成首次回应，重点关注转发量头部账号。',
-    ago(180), ago(120), 'crisis@brand.com', '卫生', a1, 'auto').lastInsertRowid
-  const c2 = ci.run('投诉类话题升温事件', 'orange', 'monitoring', '',
+    ago(180), ago(120), 'crisis@brand.com', '卫生', '食品安全', a1, 'auto').lastInsertRowid
+  const c2 = ci.run('电商预售发货投诉事件', 'orange', 'monitoring', '',
     '由橙色预警「投诉类话题升温」自动建档：命中关键词「投诉」，首条关联舆情《某电商平台预售商品迟迟不发货引用户吐槽》（热度82）。',
-    ago(90), ago(30), '', '投诉', a2, 'auto').lastInsertRowid
+    ago(90), ago(90), '', '投诉', '电商物流', a2, 'auto').lastInsertRowid
   const c3 = ci.run('某视频平台会员涨价争议', 'orange', 'closed',
     '1. 发布定价说明与会员权益升级方案\n2. 客服通道集中答疑\n3. 观察期一周，舆情回落后结案',
     '情绪以中性偏负为主，未出现大规模抵制，重点回应性价比质疑。',
-    ago(4320), ago(2840), '', '涨价', null, 'manual').lastInsertRowid
+    ago(4320), ago(2840), '', '涨价', '平台运营', null, 'manual').lastInsertRowid
+  const c4 = ci.run('新能源充电服务投诉事件', 'orange', 'monitoring', '',
+    '由橙色预警「投诉类话题升温」自动建档：命中关键词「投诉」，首条关联舆情《某新能源汽车充电服务再引分歧》（热度74）。与进行中事件话题不同，单独建档。',
+    ago(30), ago(30), '', '投诉', '新能源', a2, 'auto').lastInsertRowid
 
-  // 预警触发记录：c1/c2 由预警自动建档，c2 第二次触发去重并入；黄色规则不自动建档
+  // 危机 ↔ 规则承接关系：c1 承接 a1+a5（同一事件多条规则）；a2 分别对应 c2、c4（同规则不同事件）
+  const ca = db.prepare('INSERT INTO crisis_alerts (crisis_id, alert_id) VALUES (?,?)')
+  ca.run(c1, a1); ca.run(c1, a5); ca.run(c2, a2); ca.run(c4, a2)
+
+  // 预警触发记录：黄色规则不自动建档
   const ae = db.prepare('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)')
   ae.run(a1, 5, c1, '命中关键词「卫生」· 情感：negative · 热度90', ago(180), 'open', null)
+  ae.run(a5, 5, c1, '命中关键词「全部」· 情感：negative · 热度90', ago(180), 'open', null)
   ae.run(a2, 1, c2, '命中关键词「投诉」· 情感：negative · 热度82', ago(90), 'open', null)
-  ae.run(a2, 12, c2, '命中关键词「投诉」· 情感：negative · 热度74', ago(30), 'open', null)
+  ae.run(a2, 12, c4, '命中关键词「投诉」· 情感：negative · 热度74', ago(30), 'open', null)
   ae.run(a3, 8, null, '命中关键词「延期」· 情感：negative · 热度78', ago(60), 'open', null)
 
   const ct = db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
   ;[['自动建档', '高等级预警触发：命中关键词「卫生」· 情感：negative · 热度90', ago(180)],
+    ['规则承接', '事件承接预警规则「负面高热舆情」，后续该规则触发将并入本事件', ago(180)],
     ['全网回应', '官方发布回应声明', ago(150)],
     ['关停门店', '涉事门店暂停营业，启动自查', ago(120)]].forEach((t) => ct.run(c1, t[0], t[1], t[2]))
-  ;[['自动建档', '高等级预警触发：命中关键词「投诉」· 情感：negative · 热度82', ago(90)],
-    ['预警再次触发', '命中关键词「投诉」· 情感：negative · 热度74 · 关联舆情《某新能源汽车充电服务再引分歧》', ago(30)]].forEach((t) => ct.run(c2, t[0], t[1], t[2]))
+  ;[['自动建档', '高等级预警触发：命中关键词「投诉」· 情感：negative · 热度82', ago(90)]].forEach((t) => ct.run(c2, t[0], t[1], t[2]))
   ;[['事件建档', '人工建档，进入监测', ago(4320)],
     ['启动处置', '发布定价说明，开通集中答疑', ago(4300)],
     ['预警解除', '风险指标回落，预警解除', ago(2880)],
     ['事件结案', '舆情热度回落至常态区间，负面占比降至 5% 以下，完成处置闭环。', ago(2840)]].forEach((t) => ct.run(c3, t[0], t[1], t[2]))
+  ;[['自动建档', '高等级预警触发：命中关键词「投诉」· 情感：negative · 热度74（与进行中事件话题不同，单独建档）', ago(30)]].forEach((t) => ct.run(c4, t[0], t[1], t[2]))
 }
 seed()

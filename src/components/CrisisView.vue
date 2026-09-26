@@ -2,7 +2,7 @@
   <div class="crisis">
     <div class="toolbar">
       <button class="add" @click="showForm=!showForm">＋ 新建危机事件</button>
-      <span class="loop-hint">🔗 高等级预警（红/橙）触发自动建档，重复触发去重并入；预警解除与结案自动同步时间线</span>
+      <span class="loop-hint">🔗 高等级预警（红/橙）触发自动建档；按规则的话题+时间窗口策略归并，同一事件可承接多条规则；预警解除与结案自动同步时间线</span>
     </div>
 
     <form v-if="showForm" class="c-form" @submit.prevent="create">
@@ -33,7 +33,8 @@
         </div>
         <div class="keywords">
           <span>关键词 <i>#{{ c.keyword||'—' }}</i></span>
-          <span v-if="c.alert_title">来源规则 <i>{{ c.alert_title }}</i></span>
+          <span v-if="c.topic">话题 <i>{{ c.topic }}</i></span>
+          <span v-if="c.alert_titles">承接规则 <i>{{ c.alert_titles }}</i></span>
           <span>邮箱 <i>{{ c.linked_email||'—' }}</i></span>
           <span>更新 <i>{{ c.updated }}</i></span>
         </div>
@@ -73,11 +74,19 @@
             <div><b class="t">{{ review.stats.firstAt || '—' }}</b><em>首次触发</em></div>
             <div><b class="t">{{ review.stats.lastAt || '—' }}</b><em>最近触发</em></div>
           </div>
+          <div v-if="review.stats.byRule && review.stats.byRule.length" class="rv-rules">
+            <div v-for="r in review.stats.byRule" :key="r.id" class="rv-rule">
+              <span class="rv-dot" :class="r.level"></span>
+              <b>{{ r.title }}</b>
+              <em>触发 {{ r.triggers }} · 已解除 {{ r.resolved }} · 未解除 {{ r.open }}</em>
+            </div>
+          </div>
           <div v-if="review.events.length" class="rv-events">
             <div v-for="e in review.events" :key="e.id" class="rv-ev" :class="{resolved:e.status==='resolved'}">
               <span class="rv-dot" :class="e.alert_level"></span>
               <div class="rv-body">
                 <b>{{ e.detail }}</b>
+                <span v-if="e.alert_title">规则「{{ e.alert_title }}」</span>
                 <span v-if="e.pt">关联舆情《{{ e.pt }}》 · 热度{{ e.heat }}</span>
               </div>
               <span class="rv-st" :class="e.status">{{ e.status==='resolved' ? '已解除' : '待处置' }}</span>
@@ -209,7 +218,11 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .rv-dot.red{background:#ef5350;}.rv-dot.orange{background:#ff9800;}.rv-dot.yellow{background:#ffd54f;}
 .rv-body{flex:1;min-width:0;}
 .rv-body b{color:#dbe4f3;font-size:11px;display:block;}
-.rv-body span{color:#5b6f94;font-size:10px;}
+.rv-body span{color:#5b6f94;font-size:10px;display:block;}
+.rv-rules{display:flex;flex-direction:column;gap:4px;margin-bottom:10px;}
+.rv-rule{display:flex;align-items:center;gap:8px;background:#13233f;border-radius:7px;padding:6px 10px;}
+.rv-rule b{color:#dbe4f3;font-size:11px;}
+.rv-rule em{color:#5b6f94;font-size:10px;font-style:normal;margin-left:auto;}
 .rv-st{font-size:10px;padding:1px 7px;border-radius:5px;flex:none;}
 .rv-st.open{background:#3e2723;color:#ffab91;}
 .rv-st.resolved{background:#1b5e20;color:#a5d6a7;}

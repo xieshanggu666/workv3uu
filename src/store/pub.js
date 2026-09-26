@@ -30,10 +30,17 @@ export const usePubStore = defineStore('pub', {
       const r = await api('/posts', 'POST', p)
       await this.load() // 统计刷新（与批量导入统一）
       if (r.triggered && r.triggered.length) {
-        const parts = r.triggered.map((t) =>
-          t.deduped ? `${t.alert}（并入危机 #${t.crisisId}）`
-            : t.crisisId ? `${t.alert}（已自动建档 #${t.crisisId}）` : t.alert)
-        this.msg(`⚠️ 触发预警：${parts.join('、')}`, 'warn')
+        // 同一危机可承接多条规则，按危机归组提示
+        const byCrisis = {}
+        const parts = []
+        for (const t of r.triggered) {
+          if (!t.crisisId) { parts.push(t.alert); continue }
+          ;(byCrisis[t.crisisId] ||= { names: [], deduped: t.deduped }).names.push(t.alert)
+        }
+        for (const [cid, g] of Object.entries(byCrisis)) {
+          parts.push(`${g.names.join('、')}${g.deduped ? `（并入危机 #${cid}）` : `（已自动建档 #${cid}）`}`)
+        }
+        this.msg(`⚠️ 触发预警：${parts.join('；')}`, 'warn')
       } else this.msg('舆情已收录' + (r.sentiment === 'negative' ? '（负面）' : ''), 'success')
       return r
     },

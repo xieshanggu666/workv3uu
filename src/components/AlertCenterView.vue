@@ -14,8 +14,13 @@
             <select v-model="form.sentiment"><option value="">不限情感</option><option value="negative">负面</option><option value="positive">正面</option><option value="neutral">中性</option></select>
             <input v-model.number="form.heat_min" type="number" placeholder="热度下限" />
           </div>
+          <div class="row merge-row">
+            <label class="chk"><input type="checkbox" v-model="form.merge_topic" /> 按话题归并</label>
+            <input v-model.number="form.merge_window" type="number" min="0" placeholder="归并窗口(小时)" title="归并时间窗口（小时），0=不限" />
+            <span class="merge-hint">窗口(小时)，0=不限</span>
+          </div>
           <button class="save" type="submit">保存规则</button>
-          <p class="hint">💡 红/橙级规则触发后自动建档危机事件；同规则重复触发自动去重并入既有事件。</p>
+          <p class="hint">💡 红/橙级规则触发后自动建档危机事件；满足归并策略（话题+时间窗口）时并入既有事件，否则单独建档；同一事件可承接多条规则。</p>
         </form>
         <div class="rule-list">
           <div v-for="a in alertList" :key="a.id" class="rule" :class="a.level">
@@ -24,6 +29,7 @@
               <span class="lv">{{ a.level==='red'?'红':a.level==='orange'?'橙':'黄' }}</span>
             </div>
             <small>关键词[{{ a.keyword||'全部' }}] · {{ a.sentiment||'不限' }} · 热度≥{{ a.heat_min }}</small>
+            <small v-if="a.level!=='yellow'" class="merge-tag">归并：{{ a.merge_topic ? '按话题' : '不限话题' }} · {{ a.merge_window ? a.merge_window + 'h窗口' : '不限时间' }}</small>
             <em>触发 {{ a.trigger_count }} 次</em>
             <span v-if="a.level!=='yellow'" class="auto-tag">🤖 自动建档</span>
             <span v-if="openCount(a.id)" class="open-tag">🔔 未解除 {{ openCount(a.id) }}</span>
@@ -69,7 +75,7 @@ import { usePubStore } from '@/store/pub'
 const store = usePubStore()
 const alertList = ref([])
 const events = ref([])
-const form = ref({ title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60 })
+const form = ref({ title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60, merge_topic: true, merge_window: 24 })
 
 async function load() {
   const d = await store.fetchAlerts()
@@ -78,7 +84,7 @@ async function load() {
 }
 function add() {
   store.saveAlert(form.value)
-  form.value = { title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60 }
+  form.value = { title: '', level: 'orange', keyword: '', sentiment: '', heat_min: 60, merge_topic: true, merge_window: 24 }
   load()
 }
 function eLevel(alertId) {
@@ -111,6 +117,12 @@ h4{margin:0 0 12px;color:#fff;font-size:14px;}
 input,select,button{font-family:inherit;background:#0f1b38;border:1px solid rgba(120,160,220,0.2);color:#dbe4f3;border-radius:8px;padding:8px 10px;font-size:12px;}
 .row{display:flex;gap:8px;flex-wrap:wrap;}
 .row select,.row input{flex:1;min-width:100px;}
+.merge-row{align-items:center;}
+.merge-row .chk{display:flex;align-items:center;gap:6px;font-size:11px;color:#8ba2c8;white-space:nowrap;}
+.merge-row .chk input{width:auto;flex:none;min-width:0;}
+.merge-row input[type=number]{max-width:110px;}
+.merge-hint{font-size:10px;color:#5b6f94;white-space:nowrap;}
+.merge-tag{color:#7ea6e0 !important;}
 .save{background:#2962ff;border:none;color:#fff;font-weight:600;cursor:pointer;}
 .rule-list{display:flex;flex-direction:column;gap:8px;max-height:340px;overflow-y:auto;}
 .rule{background:#16263f;border-left:4px solid #ffd54f;border-radius:8px;padding:10px 12px;position:relative;}

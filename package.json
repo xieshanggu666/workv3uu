@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "concurrently -k -n SERVER,WEB -c blue,green \"node server/index.js\" \"vite\"",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test": "node test/integration.mjs && node test/migration.mjs"
   },
   "dependencies": {
     "express": "^4.19.2",
@@ -16,6 +17,7 @@
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.4",
     "concurrently": "^8.2.2",
+    "sql.js": "^1.14.2",
     "vite": "^5.2.8"
   }
 }
