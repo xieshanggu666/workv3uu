@@ -78,7 +78,8 @@
         <div v-if="!crises.length" class="none">暂无危机事件</div>
         <div class="crisis-row" v-for="c in crises" :key="c.id">
           <span class="c-lv" :class="c.level">{{ c.level==='red'?'红':c.level==='orange'?'橙':'黄' }}</span>
-          <span class="c-title">{{ c.title }}<i v-if="c.origin==='auto'" class="c-auto">🤖</i></span>
+          <span class="c-title">{{ c.title }}<i v-if="c.origin==='auto'" class="c-auto">🤖</i><i v-if="c.topic" class="c-topic">#{{ c.topic }}</i></span>
+          <span v-if="c.rules && c.rules.length>1" class="c-rules">多规则 ×{{ c.rules.length }}</span>
           <span v-if="c.open_events" class="c-open">🔔 {{ c.open_events }}</span>
           <span class="c-status" :class="c.status">{{ statusText(c.status) }}</span>
           <span class="c-time">{{ c.updated }}</span>
@@ -164,6 +165,8 @@ h4{margin:0 0 12px;color:#fff;font-size:14px;}
 .c-lv.red{background:#ef5350;}.c-lv.orange{background:#ff9800;}.c-lv.yellow{background:#ffd54f;color:#5d4037;}
 .c-title{color:#dbe4f3;flex:1;}
 .c-auto{font-style:normal;font-size:11px;margin-left:4px;}
+.c-topic{font-style:normal;font-size:10px;color:#90caf9;background:#0d2137;border:1px solid rgba(144,202,249,.25);border-radius:5px;padding:1px 6px;margin-left:6px;}
+.c-rules{font-size:10px;color:#ce93d8;border:1px solid rgba(206,147,216,.35);border-radius:5px;padding:1px 6px;}
 .c-open{font-size:10px;color:#ffab91;}
 .c-status{font-size:10px;padding:2px 8px;border-radius:6px;}
 .c-status.monitoring{background:#37474f;color:#b0bec5;}.c-status.disposal{background:#b71c1c;color:#ffcdd2;}.c-status.closed{background:#1b5e20;color:#a5d6a7;}

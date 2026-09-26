@@ -2,7 +2,7 @@
   <div class="crisis">
     <div class="toolbar">
       <button class="add" @click="showForm=!showForm">＋ 新建危机事件</button>
-      <span class="loop-hint">🔗 高等级预警（红/橙）触发自动建档，重复触发去重并入；预警解除与结案自动同步时间线</span>
+      <span class="loop-hint">🔗 红/橙预警按「话题 + 时间窗口」归并：同规则不同话题/超窗分别建档，同一事件可承接多条规则；预警解除与结案自动同步时间线</span>
     </div>
 
     <form v-if="showForm" class="c-form" @submit.prevent="create">
@@ -10,6 +10,7 @@
         <input v-model="form.title" placeholder="事件标题" required />
         <select v-model="form.level"><option value="red">红色 · 紧急</option><option value="orange">橙色 · 较高</option><option value="yellow">黄色 · 一般</option></select>
       </div>
+      <input v-model="form.topic" placeholder="归并话题（如 食品安全）" />
       <input v-model="form.keyword" placeholder="关联关键词" />
       <input v-model="form.linked_email" placeholder="联系邮箱（用于响应）" />
       <textarea v-model="form.plan" placeholder="处置方案（每行一项）"></textarea>
@@ -32,8 +33,13 @@
           <button class="del" @click="del(c)">✕</button>
         </div>
         <div class="keywords">
+          <span>话题 <i>#{{ c.topic||'—' }}</i></span>
           <span>关键词 <i>#{{ c.keyword||'—' }}</i></span>
-          <span v-if="c.alert_title">来源规则 <i>{{ c.alert_title }}</i></span>
+          <span v-if="c.rules && c.rules.length" class="rules-chip">
+            承接规则
+            <i v-for="r in c.rules" :key="r.alert_id" class="rule-chip" :class="r.alert_level">{{ r.alert_title }}{{ r.is_origin ? '·源' : '' }}</i>
+          </span>
+          <span v-else-if="c.alert_title">来源规则 <i>{{ c.alert_title }}</i></span>
           <span>邮箱 <i>{{ c.linked_email||'—' }}</i></span>
           <span>更新 <i>{{ c.updated }}</i></span>
         </div>
@@ -70,8 +76,16 @@
             <div><b>{{ review.stats.triggers }}</b><em>预警触发</em></div>
             <div><b>{{ review.stats.resolved }}</b><em>已解除</em></div>
             <div><b class="warn-num">{{ review.stats.open }}</b><em>未解除</em></div>
+            <div><b>{{ review.stats.rules }}</b><em>承接规则</em></div>
+            <div><b>{{ review.stats.posts }}</b><em>关联舆情</em></div>
             <div><b class="t">{{ review.stats.firstAt || '—' }}</b><em>首次触发</em></div>
             <div><b class="t">{{ review.stats.lastAt || '—' }}</b><em>最近触发</em></div>
+          </div>
+          <div v-if="review.rules && review.rules.length" class="rv-rules">
+            <span v-for="r in review.rules" :key="r.alert_id" class="rv-rule" :class="r.alert_level">
+              <i class="rd"></i>{{ r.alert_title }}<em v-if="r.is_origin" class="origin-tag">来源</em>
+              <b>{{ r.open ? r.open+' 待处置 · ' : '' }}{{ r.triggers }} 次</b>
+            </span>
           </div>
           <div v-if="review.events.length" class="rv-events">
             <div v-for="e in review.events" :key="e.id" class="rv-ev" :class="{resolved:e.status==='resolved'}">
@@ -111,14 +125,14 @@ import { ref } from 'vue'
 import { usePubStore } from '@/store/pub'
 const store = usePubStore()
 const showForm = ref(false)
-const form = ref({ title: '', level: 'orange', keyword: '', linked_email: '', plan: '', analysis: '' })
+const form = ref({ title: '', level: 'orange', topic: '', keyword: '', linked_email: '', plan: '', analysis: '' })
 const reviewId = ref(null)
 const review = ref(null)
 const closeSummary = ref('')
 
 function create() {
   store.addCrisis({ ...form.value })
-  form.value = { title: '', level: 'orange', keyword: '', linked_email: '', plan: '', analysis: '' }
+  form.value = { title: '', level: 'orange', topic: '', keyword: '', linked_email: '', plan: '', analysis: '' }
   showForm.value = false
 }
 function advance(c) {
@@ -178,8 +192,13 @@ textarea{resize:vertical;min-height:52px;}
 .st{font-size:11px;padding:2px 10px;border-radius:6px;}
 .st.monitoring{background:#37474f;color:#b0bec5;}.st.disposal{background:#b71c1c;color:#ffcdd2;}.st.closed{background:#1b5e20;color:#a5d6a7;}
 .del{background:none;border:none;color:#ef5350;font-size:15px;cursor:pointer;}
-.keywords{display:flex;gap:16px;font-size:11px;color:#8ba2c8;margin:10px 0;flex-wrap:wrap;}
+.keywords{display:flex;gap:16px;font-size:11px;color:#8ba2c8;margin:10px 0;flex-wrap:wrap;align-items:center;}
 .keywords i{color:#90caf9;font-style:normal;}
+.rules-chip{display:inline-flex;gap:5px;flex-wrap:wrap;align-items:center;}
+.rule-chip{font-style:normal;font-size:10px;padding:1px 7px;border-radius:5px;background:#0d2137;border:1px solid rgba(144,202,249,.25);color:#90caf9;}
+.rule-chip.red{color:#ef9a9a;border-color:rgba(239,83,80,.4);}
+.rule-chip.orange{color:#ffcc80;border-color:rgba(255,152,0,.4);}
+.rule-chip.yellow{color:#ffe082;border-color:rgba(255,213,79,.4);}
 .cols{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
 @media(max-width:700px){.cols{grid-template-columns:1fr;}}
 .col{background:#13233f;border-radius:10px;padding:12px;}
@@ -201,6 +220,12 @@ h5{margin:0 0 8px;color:#ffd54f;font-size:12px;}
 .rv-stats b.t{font-size:10px;color:#90caf9;line-height:1.4;}
 .rv-stats .warn-num{color:#ffab91;}
 .rv-stats em{font-size:10px;color:#5b6f94;font-style:normal;}
+.rv-rules{display:flex;flex-direction:column;gap:5px;margin-bottom:10px;}
+.rv-rule{display:flex;align-items:center;gap:6px;font-size:11px;color:#dbe4f3;background:#13233f;border-radius:7px;padding:5px 9px;}
+.rv-rule .rd{width:8px;height:8px;border-radius:50%;background:#90a4ae;flex:none;}
+.rv-rule.red .rd{background:#ef5350;}.rv-rule.orange .rd{background:#ff9800;}.rv-rule.yellow .rd{background:#ffd54f;}
+.rv-rule b{margin-left:auto;color:#90caf9;font-size:10px;font-weight:600;}
+.origin-tag{font-size:9px;font-style:normal;color:#1b2a44;background:#90caf9;border-radius:4px;padding:0 5px;}
 .rv-events{display:flex;flex-direction:column;max-height:150px;overflow-y:auto;margin-bottom:10px;}
 .rv-ev{display:flex;align-items:flex-start;gap:8px;padding:7px 0;border-bottom:1px dashed rgba(120,160,220,0.1);}
 .rv-ev:last-child{border-bottom:none;}

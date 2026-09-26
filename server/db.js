@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS alerts (
   heat_min INTEGER NOT NULL DEFAULT 0,
   active INTEGER NOT NULL DEFAULT 1,
   created TEXT NOT NULL,
-  trigger_count INTEGER NOT NULL DEFAULT 0
+  trigger_count INTEGER NOT NULL DEFAULT 0,
+  merge_topic TEXT NOT NULL DEFAULT '',   -- 危机归并话题（空=以命中舆情的话题为准）
+  merge_window INTEGER NOT NULL DEFAULT 0 -- 归并时间窗口（分钟，0=不限时长）
 );
 CREATE TABLE IF NOT EXISTS alert_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,7 +67,17 @@ CREATE TABLE IF NOT EXISTS crisis (
   linked_email TEXT NOT NULL DEFAULT '',
   keyword TEXT NOT NULL DEFAULT '',
   alert_id INTEGER,               -- 来源预警规则（自动建档时写入）
-  origin TEXT NOT NULL DEFAULT 'manual'  -- auto/manual
+  origin TEXT NOT NULL DEFAULT 'manual',  -- auto/manual
+  topic TEXT NOT NULL DEFAULT '',  -- 归并话题键（同一话题+窗口内的预警触发并入同一事件）
+  last_trigger_at INTEGER          -- 最近预警触发毫秒时间戳（时间窗口归并判断依据）
+);
+CREATE TABLE IF NOT EXISTS crisis_alerts (
+  crisis_id INTEGER NOT NULL,
+  alert_id INTEGER NOT NULL,       -- 同一事件可承接多条规则（多对多）
+  is_origin INTEGER NOT NULL DEFAULT 0,  -- 1=触发建档的来源规则
+  first_at TEXT NOT NULL,
+  last_at TEXT NOT NULL,
+  PRIMARY KEY (crisis_id, alert_id)
 );
 CREATE TABLE IF NOT EXISTS crisis_timeline (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,6 +87,16 @@ CREATE TABLE IF NOT EXISTS crisis_timeline (
   time TEXT NOT NULL
 );
 `)
+
+// 把 toLocaleString('zh-CN') 形如「2026/9/26 01:54:38」解析为毫秒时间戳（迁移/窗口计算用）
+export function parseTimeMs(s) {
+  if (s == null) return null
+  if (typeof s === 'number') return s
+  const m = String(s).match(/(\d{4})[/-](\d{1,2})[/-](\d{1,2})[ T]+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/)
+  if (!m) return null
+  const t = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0)).getTime()
+  return Number.isNaN(t) ? null : t
+}
 
 // 旧库迁移：缺列则补齐（SQLite 不支持 ADD COLUMN IF NOT EXISTS）
 function ensureColumn(table, col, ddl) {
@@ -86,6 +108,42 @@ ensureColumn('alert_events', 'status', "status TEXT NOT NULL DEFAULT 'open'")
 ensureColumn('alert_events', 'resolved', 'resolved TEXT')
 ensureColumn('crisis', 'alert_id', 'alert_id INTEGER')
 ensureColumn('crisis', 'origin', "origin TEXT NOT NULL DEFAULT 'manual'")
+ensureColumn('alerts', 'merge_topic', "merge_topic TEXT NOT NULL DEFAULT ''")
+ensureColumn('alerts', 'merge_window', 'merge_window INTEGER NOT NULL DEFAULT 0')
+ensureColumn('crisis', 'topic', "topic TEXT NOT NULL DEFAULT ''")
+ensureColumn('crisis', 'last_trigger_at', 'last_trigger_at INTEGER')
+
+// 旧关联迁移：crisis.alert_id 单规则 → crisis_alerts 多对多；回填话题与最近触发时间。
+// 幂等：仅在关联表为空时执行，历史时间线（crisis_timeline）原样保留。
+function migrateLegacyLinks() {
+  const linked = db.prepare('SELECT COUNT(*) c FROM crisis_alerts').get().c
+  if (linked > 0) return
+  const crises = db.prepare('SELECT id, alert_id, topic, updated FROM crisis').all()
+  const insLink = db.prepare('INSERT INTO crisis_alerts (crisis_id,alert_id,is_origin,first_at,last_at) VALUES (?,?,?,?,?)')
+  for (const c of crises) {
+    // 该事件关联过的全部规则（alert_events 中去重），来源规则置 is_origin=1
+    const ruleIds = db.prepare('SELECT DISTINCT alert_id FROM alert_events WHERE crisis_id=?').all(c.id).map((r) => r.alert_id)
+    if (c.alert_id && !ruleIds.includes(c.alert_id)) ruleIds.unshift(c.alert_id)
+    let topic = c.topic
+    if (!topic) {
+      const ev = db.prepare(`SELECT ae.time, p.topic ptopic FROM alert_events ae
+        LEFT JOIN posts p ON p.id=ae.post_id WHERE ae.crisis_id=? ORDER BY ae.id ASC LIMIT 1`).get(c.id)
+      topic = (ev && ev.ptopic) || ''
+    }
+    let lastAt = null, lastMs = null
+    const lastEv = db.prepare('SELECT time FROM alert_events WHERE crisis_id=? ORDER BY id DESC LIMIT 1').get(c.id)
+    if (lastEv) { lastAt = lastEv.time; lastMs = parseTimeMs(lastEv.time) }
+    if (lastMs == null) lastMs = parseTimeMs(c.updated)
+    if (topic) db.prepare('UPDATE crisis SET topic=?, last_trigger_at=? WHERE id=?').run(topic, lastMs, c.id)
+    else db.prepare('UPDATE crisis SET last_trigger_at=? WHERE id=?').run(lastMs, c.id)
+    ruleIds.forEach((rid) => {
+      const first = db.prepare('SELECT MIN(time) t FROM alert_events WHERE crisis_id=? AND alert_id=?').get(c.id, rid).t || c.updated
+      const last = db.prepare('SELECT MAX(time) t FROM alert_events WHERE crisis_id=? AND alert_id=?').get(c.id, rid).t || first
+      insLink.run(c.id, rid, rid === c.alert_id ? 1 : 0, first, last)
+    })
+  }
+}
+migrateLegacyLinks()
 
 function seed() {
   const n = db.prepare('SELECT COUNT(*) c FROM posts').get().c
@@ -134,25 +192,32 @@ function seed() {
 
   const ago = (m) => new Date(now.getTime() - m * 60000).toLocaleString('zh-CN')
 
-  const ai = db.prepare('INSERT INTO alerts (title,level,keyword,sentiment,heat_min,active,created,trigger_count) VALUES (?,?,?,?,?,?,?,?)')
-  const a1 = ai.run('负面情绪集中爆发', 'red', '卫生', 'negative', 80, 1, nowStr, 1).lastInsertRowid
-  const a2 = ai.run('投诉类话题升温', 'orange', '投诉', 'negative', 65, 1, nowStr, 2).lastInsertRowid
-  const a3 = ai.run('选址关键词监控', 'yellow', '延期', 'negative', 60, 1, nowStr, 1).lastInsertRowid
-  ai.run('正面口碑监测', 'yellow', '服务', 'positive', 50, 1, nowStr, 1)
+  const ai = db.prepare('INSERT INTO alerts (title,level,keyword,sentiment,heat_min,active,created,trigger_count,merge_topic,merge_window) VALUES (?,?,?,?,?,?,?,?,?,?)')
+  const a1 = ai.run('负面情绪集中爆发', 'red', '卫生', 'negative', 80, 1, nowStr, 1, '食品安全', 720).lastInsertRowid
+  const a2 = ai.run('投诉类话题升温', 'orange', '投诉', 'negative', 65, 1, nowStr, 2, '服务投诉', 1440).lastInsertRowid
+  const a3 = ai.run('选址关键词监控', 'yellow', '延期', 'negative', 60, 1, nowStr, 1, '房地产', 1440).lastInsertRowid
+  ai.run('正面口碑监测', 'yellow', '服务', 'positive', 50, 1, nowStr, 1, '', 0)
 
-  // 危机事件：c1 红色自动建档·处置中；c2 橙色自动建档·监测中（含去重并入）；c3 人工建档·已结案
-  const ci = db.prepare('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,alert_id,origin) VALUES (?,?,?,?,?,?,?,?,?,?,?)')
+  // 危机事件：c1 红色自动建档·处置中；c2 橙色自动建档·监测中（同话题去重并入）；c3 人工建档·已结案（承接两条规则）
+  const ci = db.prepare('INSERT INTO crisis (title,level,status,plan,analysis,created,updated,linked_email,keyword,alert_id,origin,topic,last_trigger_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
   const c1 = ci.run('某连锁品牌门店卫生事件', 'red', 'disposal',
     '1. 24小时内全网回应，公布整改时间表\n2. 关停涉事门店并启动第三方复查\n3. 官方渠道连续发布整改动态\n4. 与权威媒体合作发布透明报告',
     '负面传播主阵地为短视频与微博，需在2小时内完成首次回应，重点关注转发量头部账号。',
-    ago(180), ago(120), 'crisis@brand.com', '卫生', a1, 'auto').lastInsertRowid
+    ago(180), ago(120), 'crisis@brand.com', '卫生', a1, 'auto', '食品安全', new Date(now.getTime() - 180 * 60000).getTime()).lastInsertRowid
   const c2 = ci.run('投诉类话题升温事件', 'orange', 'monitoring', '',
     '由橙色预警「投诉类话题升温」自动建档：命中关键词「投诉」，首条关联舆情《某电商平台预售商品迟迟不发货引用户吐槽》（热度82）。',
-    ago(90), ago(30), '', '投诉', a2, 'auto').lastInsertRowid
+    ago(90), ago(30), '', '投诉', a2, 'auto', '服务投诉', new Date(now.getTime() - 30 * 60000).getTime()).lastInsertRowid
   const c3 = ci.run('某视频平台会员涨价争议', 'orange', 'closed',
     '1. 发布定价说明与会员权益升级方案\n2. 客服通道集中答疑\n3. 观察期一周，舆情回落后结案',
     '情绪以中性偏负为主，未出现大规模抵制，重点回应性价比质疑。',
-    ago(4320), ago(2840), '', '涨价', null, 'manual').lastInsertRowid
+    ago(4320), ago(2840), '', '涨价', null, 'manual', '会员涨价', new Date(now.getTime() - 2880 * 60000).getTime()).lastInsertRowid
+
+  // 事件↔规则多对多：c3 为人工建档但承接了两条规则（同一事件承接多条规则）
+  const cl = db.prepare('INSERT INTO crisis_alerts (crisis_id,alert_id,is_origin,first_at,last_at) VALUES (?,?,?,?,?)')
+  cl.run(c1, a1, 1, ago(180), ago(180))
+  cl.run(c2, a2, 1, ago(90), ago(30))
+  cl.run(c3, a2, 0, ago(4310), ago(4300))
+  cl.run(c3, a3, 0, ago(2880), ago(2880))
 
   // 预警触发记录：c1/c2 由预警自动建档，c2 第二次触发去重并入；黄色规则不自动建档
   const ae = db.prepare('INSERT INTO alert_events (alert_id,post_id,crisis_id,detail,time,status,resolved) VALUES (?,?,?,?,?,?,?)')
@@ -160,6 +225,9 @@ function seed() {
   ae.run(a2, 1, c2, '命中关键词「投诉」· 情感：negative · 热度82', ago(90), 'open', null)
   ae.run(a2, 12, c2, '命中关键词「投诉」· 情感：negative · 热度74', ago(30), 'open', null)
   ae.run(a3, 8, null, '命中关键词「延期」· 情感：negative · 热度78', ago(60), 'open', null)
+  // c3 人工建档但处置期承接了 a2/a3 两条规则，结案时已一并解除（历史闭环）
+  ae.run(a2, 11, c3, '命中关键词「投诉」· 情感：negative · 热度70', ago(4310), 'resolved', ago(2880))
+  ae.run(a3, 11, c3, '命中关键词「延期」· 情感：negative · 热度66', ago(2880), 'resolved', ago(2880))
 
   const ct = db.prepare('INSERT INTO crisis_timeline (crisis_id,action,note,time) VALUES (?,?,?,?)')
   ;[['自动建档', '高等级预警触发：命中关键词「卫生」· 情感：negative · 热度90', ago(180)],
